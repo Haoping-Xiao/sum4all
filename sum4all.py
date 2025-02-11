@@ -22,7 +22,7 @@ from pptx import Presentation
 from PIL import Image
 import base64
 import html
-from .video_to_text import url_to_text
+from .video_to_text import url_to_text, upload_audio_to_oss, remove_audio_from_oss
 from .notion_helper import create_notion_page
 
 
@@ -119,6 +119,7 @@ class sum4all(Plugin):
             self.image_sum_qa_prefix = self.image_sum.get("qa_prefix", "问")
             self.image_sum_prompt = self.image_sum.get("prompt", "")
 
+            self.note_user_id = self.note.get("user_id", "")
             self.note_enabled = self.note.get("enabled", False)
             self.note_service = self.note.get("service", "")
             self.note_prefix = self.note.get("prefix", "记")
@@ -176,7 +177,7 @@ class sum4all(Plugin):
                 self.params_cache[user_id]['prompt'] = new_content
                 logger.info('params_cache for user has been successfully updated.')            
                 self.call_service(self.params_cache[user_id]['last_url'], e_context ,"sum")
-            elif 'last_url' in self.params_cache[user_id] and content.startswith(self.note_prefix) and self.note_enabled and not isgroup:
+            elif 'last_url' in self.params_cache[user_id] and content.startswith(self.note_prefix) and self.note_enabled and self.note_user_id == user_id:
                 logger.info('Content starts with the note_prefix.')
                 new_content = content[len(self.note_prefix):]
                 self.params_cache[user_id]['note'] = new_content
@@ -222,12 +223,13 @@ class sum4all(Plugin):
             # 检查是否应该进行图片总结
             if self.image_sum_enabled:
                 # 将图片路径转换为Base64编码的字符串
-                base64_image = self.encode_image_to_base64(image_path)
+                url = upload_audio_to_oss(image_path)
+                # base64_image = self.encode_image_to_base64(image_path)
                 # 更新params_cache中的last_image_path
                 self.params_cache[user_id] = {}
-                self.params_cache[user_id]['last_image_base64'] = base64_image
+                self.params_cache[user_id]['last_image_base64'] = url
                 logger.info('Updated last_image_base64 in params_cache for user.')
-                self.handle_image(base64_image, e_context)
+                self.handle_image(url, e_context)
 
             else:
                 logger.info("图片总结功能已禁用，不对图片内容进行处理")
@@ -876,7 +878,7 @@ class sum4all(Plugin):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}"
             }
-            model = "gpt-4o-mini"
+            model = "qwen-vl-plus"
         elif self.image_sum_service == "azure":
             api_key = self.open_ai_api_key
             api_base = f"{self.open_ai_api_base}/openai/deployments/{self.azure_deployment_id}/chat/completions?api-version=2024-02-15-preview"
@@ -945,13 +947,13 @@ class sum4all(Plugin):
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                    "url": base64_image
                                 }
                             }
                         ]
                     }
                 ],
-                "max_tokens": 3000
+                "max_tokens": 2000
             }
         try:
             response = requests.post(api_base, headers=headers, json=payload)
@@ -980,6 +982,7 @@ class sum4all(Plugin):
         reply = Reply()
         reply.type = ReplyType.TEXT
         reply.content = f"{remove_markdown(reply_content)}\n\n💬5min内输入{self.image_sum_qa_prefix}+问题，可继续追问"
+        remove_audio_from_oss(e_context["context"].content)
         e_context["reply"] = reply
         e_context.action = EventAction.BREAK_PASS
     
