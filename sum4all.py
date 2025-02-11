@@ -1,11 +1,14 @@
 import requests
 import json
 import re
+import traceback
 import plugins
+from bridge import bridge
 from bridge.reply import Reply, ReplyType
 from bridge.context import ContextType
 from channel.chat_message import ChatMessage
 from plugins import *
+from common import const
 from common.log import logger
 from common.expired_dict import ExpiredDict
 import os
@@ -19,7 +22,8 @@ from pptx import Presentation
 from PIL import Image
 import base64
 import html
-
+from .video_to_text import url_to_text
+from .notion_helper import create_notion_page
 
 
 EXTENSION_TO_TYPE = {
@@ -87,11 +91,13 @@ class sum4all(Plugin):
 
             # 提取sum服务的配置
             self.url_sum_enabled = self.url_sum.get("enabled", False)
+            self.url_sum_api_key = self.url_sum.get("api_key", "")
             self.url_sum_service = self.url_sum.get("service", "")
             self.url_sum_group = self.url_sum.get("group", True)
             self.url_sum_qa_enabled = self.url_sum.get("qa_enabled", True)
             self.url_sum_qa_prefix = self.url_sum.get("qa_prefix", "问")
             self.url_sum_prompt = self.url_sum.get("prompt", "")
+            self.url_sum_video_prompt = self.url_sum.get("video_prompt", "")
 
             self.search_sum_enabled = self.search_sum.get("enabled", False)
             self.search_sum_service = self.search_sum.get("service", "")
@@ -124,7 +130,8 @@ class sum4all(Plugin):
             logger.warn(f"sum4all init failed: {e}")
     def on_handle_context(self, e_context: EventContext):
         context = e_context["context"]
-        if context.type not in [ContextType.TEXT, ContextType.SHARING,ContextType.FILE,ContextType.IMAGE]:
+        logger.info(f"on_handle_context: {context}")
+        if context.type not in [ContextType.TEXT, ContextType.SHARING,ContextType.FILE,ContextType.IMAGE, ContextType.VIDEO]:
             return
         msg: ChatMessage = e_context["context"]["msg"]
         user_id = msg.from_user_id
@@ -227,6 +234,15 @@ class sum4all(Plugin):
             # 删除文件
             os.remove(image_path)
             logger.info(f"文件 {image_path} 已删除")
+        elif context.type == ContextType.VIDEO:
+            try:
+                # 处理视频号
+                self.params_cache[user_id] = {}
+                self.params_cache[user_id]['last_url'] = content
+                self.handle_video(content, e_context)
+            except Exception as e:
+                logger.error(e)
+                traceback.print_exc()
         elif context.type == ContextType.SHARING and self.url_sum_enabled:  #匹配卡片分享
             content = html.unescape(content)
             if unsupported_urls:  #匹配不支持总结的卡片
@@ -257,7 +273,7 @@ class sum4all(Plugin):
                     logger.info('Updated last_url in params_cache for user.')
                     self.call_service(content, e_context, "sum")
                     return
-            
+        
         elif url_match and self.url_sum_enabled: #匹配URL链接
             if unsupported_urls:  #匹配不支持总结的网址
                 logger.info("[sum4all] Unsupported URL : %s", content)
@@ -272,6 +288,14 @@ class sum4all(Plugin):
                 logger.info('Updated last_url in params_cache for user.')
                 self.call_service(content, e_context, "sum")
                 return
+        elif context.type == ContextType.TEXT:
+            bot = bridge.Bridge().find_chat_bot(const.QWEN_DASHSCOPE)
+            bot.sessions.session_args["system_prompt"] = conf().get("character_desc", "")
+            reply = bot.reply(content, context)
+            e_context["reply"] = reply
+            e_context.action = EventAction.BREAK_PASS
+            return
+    
     def call_service(self, content, e_context, service_type):
         if service_type == "search":
             if self.search_sum_service == "openai" or self.search_sum_service == "sum4all" or self.search_sum_service == "gemini" or self.search_sum_service == "azure":
@@ -288,6 +312,24 @@ class sum4all(Plugin):
         elif service_type == "note":
             if self.note_service == "flomo":
                 self.handle_note(content, e_context)
+            elif self.note_service == "notion":
+                self.handle_notion(content, e_context)
+
+    def handle_notion(self, link, e_context):
+        user_id = e_context["context"]["msg"].from_user_id
+        content = self.params_cache[user_id].get('content', '')
+        note = self.params_cache[user_id].get('note', '')
+        reply = Reply()
+        reply.type = ReplyType.TEXT
+        try:
+            notion_url = create_notion_page(link, content, note)
+            reply.content = f"已保存到Notion: {notion_url}"        
+        except Exception as e:
+            logger.error(f"create notion page failed {e}")
+            reply.content = f"发送失败，错误信息：{e}"
+        e_context["reply"] = reply
+        e_context.action = EventAction.BREAK_PASS
+        
     def handle_note(self,link,e_context):
         msg: ChatMessage = e_context["context"]["msg"]
         user_id = msg.from_user_id
@@ -327,6 +369,32 @@ class sum4all(Plugin):
             if short_url:
                 return short_url
         return None
+    def handle_video(self, content, e_context):
+        video_text = url_to_text(content)
+        context = e_context["context"]
+        # video_text = "普通的人没有什么资源，怎么找到这些好的项目呢？你多大？三十多？你现在有钱吗？比普通上班族好一些。那我想问你一个问题啊，你能不能告诉我你是怎么错过自媒体，错过电商，错过错过比特币的？你把这个问题悟透了，你就知道为什么你不行了。我觉得你们其实也可以悟一悟，都说我们这个时代没有机会。其实我们20年的经验过来，我跟你讲我们这个机会不是多是太多了。从房产到实体，20年前实体的大机会，到后面电商崛起，比特币啊，包括现在的短视频自媒体，在座的各位谁采用了？事实上你有没有发现，还有这些行业在开始的时候都是不投钱的，真的就是拿个手机就能挣钱。那你能告诉我你是怎么过的吗？你能把这个要想明白了，你就知道下一步怎么迎接了。那个时候意识不到这些东西，你为什么意识不到这些东西？理解不够？我告诉你不是啊，我给你个正确答案啊。因为你看事情永远要从三个角度来看。那这个时候刚做起来以后，那些人都开始了劳斯莱斯，我们的社会就在评价什么就傻逼了。因为第一呢我们一定要明白的道理，一件事情一旦有人做成了，他就是真的。美国有句谚语啊，如果一个生物走路像压，叫声像鸭子，它就是一只鸭子，你要信吗？明白一个点啊，一个事儿如果别人做成了，你不理解，通常是自己傻。成功即代表一切。然后第二呢我们要去分析他投多少钱，挣多少钱，他到底是不是盈利的。你不要想第三个东西，我给你一盘屎你吃不吃，那肯定不吃啊。给你一个亿是不是？你不能用赚钱以外的逻辑来看待这个行业。因为绝大部分行业在开始的时候真的很low。我之前做电商很早就能挣钱。07年08年的时候我在这个地方到10年左右，我拉我身边的人干很多都不干。你觉得不务正业。电商也是一样，比特币也是一样。这个东西你要记住了，挣钱就挣钱，你不能去因为他看起来不好觉的钱你知道吗？很多人是因为看钱以外的逻辑去看这件事，所以导致的错之商机。很多钱真的是脏钱搂钱。那么你觉得做网红抛头露面他就一定是好事情？他也不是，到现在也一直有人说，哎，那么大的老板，你看抖音不觉得丢人吗？一个大他妈吐死的干什么不丢人？你卖货就高级了，这个袜子就高级了？不会的。第三要看一个东西叫什么？叫操作难度，这个能不能干？比特币早些年入场的时候，你下场研究了吗？你买个比特币你会花多长时间？早几年去做抖音，拿个手机随便拍，随便报，这三个维度交织思考问题，你才不会错过商机。给你磨一下现实厂家，你周围一个傻子突然间看奥迪了，你就问问他兄弟你干嘛的？他跟你讲要给我收废品的，你不能说我这么姐，你得去了解你那个点儿在哪呀，你投了多少钱呀，你都怎么收的，你这样才有机会上车，明白我意思吧？绝大部分人他错过商机的本质什么？因为他的思维系统太过于复杂。人啊真正应该搭建的是什么？思考问题的方式，这个会很高级。森哥如果你现在是一个普通人的话，你会怎么去改变自己的这种现状啊？不好意思，现在不普通了，我的整个生涯也真的是运气占了绝大部分，真的没有你们想象的特别复杂。包括你说所谓的大老板，我认识的太多了，要么投胎好，要么婚姻好。因为现在我就碰到了一个行业，我就觉得这个行业不需要我什么能力，但是我确实是比以前赚的多了。意识到严哥你以前说的那个项目，真的是决定你的一些收入。所以说我现在就最近在思考，看不到这些好的项目。哎呀，那些事其实就一句话，挣钱了以后去报商学院，有钱报长江，没钱报我的看看世界，看看其他朋友在干什么。说信息圈终结了还能怎么看？真的以为老板到长江是为了去学什么东西了，都是交朋友，看看同等到的是干嘛的，一群没有钱的总会说一句话，有钱人被淘汰，我就想不明白，白一个职场混工资的人，你你怀怀疑老板干嘛的？是谁智商不行了？信息的价值往往是比工作要值钱100倍的，你见过哪个老板挣钱是闷在家里的，对不对？各种商学院去报一报，你报一圈，大家都是交8万的，都是交50万、60万的，他圈子质量是一样的。我有的时候我也看那些骂我的人什么样，我说你罗斯就就是这种小老板，要么就职场大学生，没办法，无解。你跟他讲信息值钱，交个朋友他们会下面。哎，有钱人都是傻子，他们花8万块钱交朋友被割了，这不是事实吗？为什么有这种想法？因为没搞到钱了。在你们的认知里面，一年搞个100万、200万就很好了。在有些圈子里面这个收入是不好意思说的。深耕都面临。"
+        video_title = e_context["context"]["msg"].title
+
+        msg: ChatMessage = context["msg"]
+        # 刷新context type to text
+        context["type"] = ContextType.TEXT
+        user_id = msg.from_user_id
+        user_params = self.params_cache.get(user_id, {})
+        system_prompt = user_params.get('prompt', self.url_sum_video_prompt)
+        logger.info(f"system_prompt: {system_prompt}")
+        user_prompt = f"<title>小视频标题</title>\n\n{video_title}\n\n<transcript>小视频文案</transcript>\n\n{video_text}"
+        logger.info(f"user_prompt: {user_prompt}")
+        bot = bridge.Bridge().find_chat_bot(const.QWEN_DASHSCOPE)
+        bot.sessions.session_args["system_prompt"] = system_prompt
+        reply = bot.reply(user_prompt, context)
+
+        self.params_cache[user_id]['content'] = reply.content
+        self.params_cache[user_id]['title'] = video_title
+
+        e_context["reply"] = reply
+        e_context.action = EventAction.BREAK_PASS
+        return
+    
     def handle_url(self, content, e_context):
         logger.info('Handling Sum4All request...')
         # 根据sum_service的值选择API密钥和基础URL
@@ -368,8 +436,8 @@ class sum4all(Plugin):
             api_url = "https://ai.sum4all.site"
             response = requests.post(api_url, headers=headers, data=payload)
             response.raise_for_status()
-            logger.info('Received response from LLM.')
             response_data = response.json()  # 解析响应的 JSON 数据
+            logger.info('Received response from LLM. %s', response_data)
             if response_data.get("success"):
                 content = response_data["content"].replace("\\n", "\n")  # 替换 \\n 为 \n
                 self.params_cache[user_id]['content'] = content
